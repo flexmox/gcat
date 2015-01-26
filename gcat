@@ -1,0 +1,961 @@
+#!/bin/bash
+
+ESC="\033"
+GRAY="[5m"
+NORMAL="[0m"
+BCYAN="[0;36m"
+BLUE="[0;34m"
+BYELLOW="[1;33m"
+BRED="[1;31m"
+BGREEN="[1;32m"
+DIR=$(dirname "$0")
+PROG=$(basename "$0")
+"$DIR"/ch "$PROG" "$@" 2> /dev/null 
+files=( )
+fileCount=0
+icatFS=`echo -en "\t"`
+icatFSR=`echo -en "\t"`
+onlyone=1
+calledheaders=""
+stdo=1
+merging="full"
+stat=0
+visualStat=0
+insert=""
+bar=0
+err=1
+tabmerge=""
+tabcount=0
+firstheadersCount=0
+tabmergeBar=0
+tabmergeSize=100
+tabfilter=0
+tabdedupe=0
+tabmergeNoKey=0
+fhc=0
+interactive=0
+preBlanksCount=0
+remover=0
+tabPipe="-"
+
+flags="""
+Default behavior writes out all columns across all files in the order they are seen
+
+Flags:
+  -s     = prints out status of file headers
+  -v     = prints out status of file headers in \`less\`
+  -d     = specify single file delimiter (default is \\\t)
+  -r     = replace single file delimiter (default is whatever is set for -d)
+  -h     = specify headers (ex: -h\"header1,header2\")
+  -^h    = removes specified headers
+  -f     = specify index (ex: -f\"1,2,3-4\")
+  -^f    = removes specified index
+  -i     = Interactive Mode
+  -b     = force progress bar
+  -p     = used with -m to put \"string\" instead of blanks
+  -m1    = only writes columns based on the first file; new columns will not be added
+  -m2    = only writes columns in common accross all files, no order.
+  --help = displays help
+
+  -t = tabmerge (normal ex: gcat -t\"key\" file1 file2)
+       Used in conjunction with tabmerge (ex: gcat -t\"key\" --filter file1 file2):
+       If no key given, assumes first column header as the key
+       --filter (--f) = prints rows from file1 which are NOT in file2
+       --dedupe (--d) = prints rows from file1 which ARE in file2
+                      = if only one file given; prints unique rows from file1
+       --t = tabmerge assuming first column header as key
+       -x  = specify values (instead of file2) to filter/dedupe by (ex: -x\"asdf,whatever\")
+"""
+
+helper()
+{
+     echo -e """
+Description: 
+  This program is used to cat multiple files with smart headers enabled.
+  Meaning it will cat files together based on their column header names case 
+  insensitive.  If you have multiple files with columns out of order in each file
+  this program will reorder their columns based on the column order of the first file.   
+             
+${flags}
+    """
+    exit -1;  
+}
+
+PIPE="`readlink /proc/$$/fd/0 | grep "^pipe:"`"
+
+if [[ ${#@} == 0 && $PIPE == "" ]]; then
+    echo -e "${flags}\n"
+    exit -1;
+fi
+
+traper() 
+{
+    tmper="/tmp/${PROG}$$${1}"
+    if [[ $1 == "x" ]]; then
+        tabPipe="$tmper";
+    fi
+    tmp="$tmp"" ""$tmper"
+    trap "/bin/rm -fr $tmp${fdclear}; exit" 0 1 2 3 15
+}
+
+
+if [[ $PIPE != "" ]]; then 
+    fdclear="; exec 0<&3 3<&-"
+    traper
+    cat > $tmper
+    ## redirects stdin in case of interactive mode
+    exec 3<&0
+    exec 0</dev/tty
+    for i in "$@"; do
+        if [[ -e "$i" ]];then
+            foundFile=1
+        fi
+        if [[ "$i" == "-" && ! $addedPipe ]];then
+            addedPipe=1
+            if [[ "$CL" ]];then
+                CL=( "${CL[@]}" "$tmper" )
+            else
+                CL=( "$tmper" )    
+            fi
+        elif [[ "$i" != "-" ]];then 
+            if [[ "$CL" ]];then
+                CL=( "${CL[@]}" "$i" )
+            else
+                CL=( "$i" )
+            fi
+        fi  
+    done
+    if [[ ! $foundFile && ! $addedPipe ]];then
+        if [[ "$CL" ]];then
+            CL=( "${CL[@]}" "$tmper" )
+        else
+            CL=( "$tmper" )
+        fi
+    fi
+fi
+
+if [[ $PIPE != "" ]];then
+    eval set -- `getopt --name "$PROG" --long help,dedupe,filter,match,t --options d:r:h:f:p:ibvesm:t:^:x: -- "${CL[@]}"`
+else 
+    eval set -- `getopt --name "$PROG" --long help,dedupe,filter,match,t --options d:r:h:f:p:ibvesm:t:^:x: -- "$@"`
+fi
+
+while [ ! -z "$1" ]; do
+    case "$1" in
+    -d)  d=`echo -e "$2"`;
+        if [[ ${#d} > 1 ]]; then
+            echo "gcat: the delimiter must be a single character" >&2; exit;
+        fi
+        icatFS=`echo -en "${2//\n/\\n}"`;
+        icatFSR=`echo -en "${2//\n/\\n}"`;
+        shift;;
+    -r)  icatFSR=`echo -en "${2//\n/\\n}"`; shift;;
+    -f)  callednumbers="$2";shift;;
+    -h)  calledheaders="$2";shift;; 
+    -^)  case "${2::1}" in
+        "f") remover=1;callednumbers="${2:1}";;
+        "h") remover=1;calledheaders="${2:1}";;
+        *) echo "$PROG: invalid option -- ${2::1} for $1" >&2;;
+        esac;shift
+    ;;               
+    -i)  stdo=0;interactive=1;;
+    -s)  stat="show";;
+    -v)  visualStat="vshow";stat="show";;
+    -m)  case "$2" in
+        "2") merging=0;;
+        "1") merging="partial";;
+        *) echo "$PROG: invalid option -- $2 for $1" >&2;;
+        esac;shift
+    ;;
+    -p)  insert="$2";shift;;
+    -b)  stdo=1;bar=1;;
+    -e)  err=0;;
+    -t)  tabmerge=`echo "$2" | tr "[:upper:]" "[:lower:]"`;shift;;
+    -x)  namedPipe=`echo "$2" | tr "[:upper:]" "[:lower:]"`;shift;;
+    --help)  helper;;
+    --dedupe) tabdedupe=1;;
+    --match) tabdedupe=1;;
+    --filter) tabfilter=1;;
+    --t) tabmergeNoKey=1;;
+    *)  break;;
+    esac
+    shift
+done;
+shift
+
+makeNamedPipe()
+{
+    traper x;
+    echo -e "$tabmerge\n$namedPipe" | sed -e "s/,/\n/g" | sed -e 's/\r//g' -e "s/^ *//g" -e "s/ *$//g" > $tabPipe;
+}
+
+if [[ $tabmerge != "" || $tabmergeNoKey == 1 || $tabfilter == 1 || $tabdedupe == 1 || $namedPipe != "" ]];then
+    if [[ "$1" == "$2" && "$1" != "" ]];then
+        echo "gcat: No sense in tabmerging a file against itself" >&2
+        exit -1 
+    elif [[ $namedPipe != "" && $tabfilter == 0 && $tabdedupe == 0 ]]; then
+        echo "gcat: Must specify --d (matching) or --f (filter out) when using -x option" >&2;
+        exit -1;
+	elif [[ $# != 1 && $namedPipe != "" ]]; then
+		echo "gcat: Can only filter or match against one file when using -x option" >&2;
+		exit -1;
+    elif [[ $# != 2 || ! -e $1 || ! -e $2 ]]; then
+        if [[ $tabdedupe == 1 && $# -gt 2 ]]; then
+            echo "gcat: Must have one or two files when using dedupe" >&2;
+            exit -1;
+        elif [[ $tabdedupe == 0 && $namedPipe == "" ]];then
+            echo "gcat: Must have two files exactly when using tabmerge" >&2;
+            exit -1;
+		fi
+    fi
+fi
+
+
+if [[ "$icatFSR" =~ "\\\\" && "$icatFSR" != "\n" ]]; then
+    icatFSR=$(echo "$icatFSR" | sed 's/\\/\\\\/g');
+fi
+
+if [[ "$icatFSR" =~ '"' ]]; then
+    icatFSR=$(echo "$icatFSR" | sed 's/"/\\042/g');
+fi
+
+if [[ "$icatFS" =~ '"' ]]; then
+    icatFS=$(echo "$icatFS" | sed 's/"/\\042/g');
+fi
+
+if [[ "$insert" =~ "\\\\" && "$insert" != "\n" ]]; then
+    insert=$(echo "$insert" | sed 's/\\/\\\\/g');
+fi
+
+if [[ "$insert" =~ '"' ]]; then
+    insert=$(echo "$insert" | sed 's/"/\\042/g');
+fi
+
+if [[ "$icatFS" =~ "/" ]] ;then theifs="${icatFS////\\/}"; else theifs="${icatFS//\\/\\\\\\\\}"; fi
+
+cleanRow()
+{
+    sed -e 's/\r//g' -e "s/ \+${theifs//$/\$}/${theifs}/g" -e "s/${theifs//^/\^} \+/${theifs}/g" -e "s/^ *//g" -e "s/ *$//g"
+}
+ 
+if [[ $calledheaders ]]; then
+    calledheaders=$(echo "$calledheaders" | sed -e "s/,/${theifs}/g" | cleanRow)
+fi
+
+OFS="$IFS"
+IFS=`echo -en "$icatFS"`
+firstheaders=""
+
+calledMatch()
+{
+    awk -vcatFS="$icatFS" -vcheaders="$calledheaders" 'BEGIN{FS=(catFS); ORS=FS; count=split(cheaders, tarr, FS);}{while(j++<count){i=0; while(i++<NF){if(tolower($i) == tolower(tarr[j]) && !(tolower($i) in bad)){bad[tolower($i)]++; print $i;break;}}}}'
+}
+
+unCalledMatch()
+{
+    awk -vcatFS="$icatFS" -vcheaders="$calledheaders" 'BEGIN{FS=(catFS); ORS=FS; count=split(cheaders, tarr, FS);}{while(i++<NF){j=0;bad=0; while(j++<count){if(tolower($i) == tolower(tarr[j])){bad++;break;}}if(!bad){print $i;}}}'
+}
+
+tabmergeIndex()
+{
+    awk -vcatFS="$icatFS" 'BEGIN{FS=(catFS)}{while(i++<NF){if(tolower("'$tabmerge'") == tolower($i)){print i; exit}}}'
+}
+
+for i in "$@" "$tabPipe"; do
+    if [[ -e "$i" || $makePipe == 1 ]]; then #Master builder of all column headers
+        if [[ $fileCount == 0 && $merging == "partial" ]] || [[ $merging != "partial" ]] || [[ $stat == "show" ]];then
+            if [[ -p "$i" ]];then
+                traper $fileCount
+                cat "$i" > $tmper
+                i="$tmper"   
+            fi
+            if [[ $makePipe == 1 ]];then
+                makeNamedPipe;
+                i="$tabPipe";    
+            fi
+            temp=`head -1 "$i" | cleanRow`
+            if [[ $stat != "show" || $# -gt 1 ]]; then
+                tempcheck=`echo "$calledheaders" | tr "[:upper:]" "[:lower:]"`
+                dupecheck=(`echo "$temp" | awk -vcatFS="$icatFS" 'BEGIN{FS=(catFS);}{bad=0;while(i++<NF){if(tolower($i) in arr && (!"'"$calledheaders"'" || "'"${tempcheck[*]}"'" ~ tolower($i))){printf("\"%s\", ",$i)}else{arr[tolower($i)]=1}}}' | sed 's/, $//'`)
+                if [[ ${#dupecheck} != "0" ]]; then 
+                    echo "gcat: Duplicate headers found in file \"$i\" [${dupecheck[@]}]" >&2;
+                    dupebad=1;
+                fi
+            fi
+            if [[ $stat = "show"  ]]; then
+                if [[ "$temp" =~ ":::" ]]; then
+                    echo "gcat: Sorry, can't run status. Some headers are using special status string \":::\"" >&2
+                    exit -1
+                fi
+                temp=`echo "$temp" | awk -vcatFS="$icatFS" 'BEGIN{FS=(catFS); ORS=FS}{while(i++<NF){print $i":::""'"$i"'"}}' `
+                temp="${temp%`echo "$icatFS"`}"
+            else      
+                tempbak="$temp"
+                if [[ $calledheaders ]]; then
+                    if [[ $remover == 1 ]]; then
+                        temp=`echo "$temp" | unCalledMatch`
+                    else
+                        temp=`echo "$temp" | calledMatch`
+                    fi
+                    temp="${temp%`echo "$icatFS"`}"
+                fi
+            fi
+            if [[ "$headers" ]]; then
+                headers="${headers}${IFS}${temp}"      
+            else
+                headers="$temp"
+            fi
+            let fileCount=fileCount+1;
+        fi
+        if [[ ! $firstheaders ]]; then
+            firstheaders="$temp"
+            if [[ $tabfilter == 1 && $tabmerge == "" ]] || [[ $tabdedupe == 1 && $tabmerge == "" ]] || [[ $tabmergeNoKey == 1 && $tabmerge == "" ]];then
+                tabmerge="${temp%%`echo "$icatFS"`*}"
+                echo " Tabmerge assuming key is... ${tabmerge}" >&2;
+            fi
+            if [[ $tabmerge != "" ]];then 
+                firstheadersCheck=`echo "$temp" | tabmergeIndex`
+                if [[ ! "$firstheadersCheck" && $stat != "show" ]];then
+                    echo "gcat: Invalid tabmerge key. Try another" >&2
+                    exit -1
+                fi
+            fi
+            if [[ $namedPipe ]]; then
+                makePipe=1;
+            fi
+            if [[ $tabmerge != "" ]]; then fhc=`echo "$tempbak" | tabmergeIndex`; fi
+            firstheadersCount=`echo "$firstheaders" | awk -vcatFS="$icatFS" 'BEGIN{FS=(catFS)}{print NF}'`
+        fi
+        if [[ "$tabmerge" != "" && $fileCount == 2 && $stat != "show" ]];then
+            tabmergeFile="$i"
+            tab=`head -1 "$tabmergeFile" | cleanRow`
+            tabmergeCheck=`echo "$temp" | tabmergeIndex`
+            if [[ ! "$tabmergeCheck" ]];then
+                echo "gcat: Invalid tabmerge key. Try another" >&2
+                exit -1
+            fi
+        else
+            files=( ${files[@]} $i )
+        fi
+    elif [[ $i != "-" ]];then
+        echo "gcat: $i: No such file or directory" >&2
+    fi    
+done
+
+if [[ $fileCount == 0 ]]; then
+    #echo "No File. Try Again" >&2;
+    exit -1;
+fi
+
+if [[ $dupebad == 1 ]]; then
+    echo "Try gcat -s [FILE] to see where the dupes are." >&2;
+    exit -1;
+fi
+
+getStatus()
+{
+    awk -vfcount="$fileCount" -vcatFS="$icatFS" '
+    BEGIN {
+        FS=catFS
+        ORS=FS
+    }
+    {
+        filenames=""
+        while(j++<NF)
+        {
+            sc=split($j, file, ":::")
+            if(file[2] in filearr)
+            {}
+            else if(sc>1)
+            {                
+                filearr[file[2]]=1
+                filenames=(filenames)":::""\""(file[2])"\""
+            }
+        }
+        filenames=filenames":::"
+        while(i++<NF)
+        {
+            sc=split($i, arr0, ":::")
+            header=tolower(arr0[1])
+            if(header in arr)
+            {   
+                gsub("\\(", "\\\050", arr0[2])
+                gsub("\\)", "\\\051", arr0[2])                          
+                gsub(":::\""arr0[2]"\":::", ":::", arr[header])      
+            }
+            else if(sc>1)
+            {
+                tempfilenames=filenames
+                gsub("\\(", "\\\050", arr0[2])
+                gsub("\\)", "\\\051", arr0[2])
+                #print "\nBEFORE: "(tempfilenames) > "/dev/stderr"
+                gsub(":::\""arr0[2]"\":::", ":::", tempfilenames)
+                #print "\nAFTER: "(tempfilenames) > "/dev/stderr"
+                arr[header]=tempfilenames
+                hcount++
+            }
+        }
+                
+    }END{
+        while(k++<NF)
+        {
+            sc=split($k, arr3, ":::")
+            header=tolower(arr3[1])
+            if( header in ar && fcount > 1)
+            {}
+            else if(sc>1)
+            {
+                ar[header]=1                    
+                print arr3[1](arr[header])
+            }
+        } 
+        
+    }'
+}
+
+getAll()
+{
+    awk -vfcount="$fileCount" -vcatFS="$icatFS" '
+    BEGIN {
+        FS=catFS
+    }
+    {
+        while(i++<NF)
+        {
+            temp=tolower($i)
+            if(temp in arr)
+            {}
+            else
+            {
+                arr[temp]=1;
+                if(gw=="")
+                {
+                    gw=$i;
+                }
+                else
+                {
+                    gw=(gw)(catFS)($i);
+                }
+            }
+        }
+        print gw;
+    }'
+}
+
+getInCommon()
+{
+    awk -vfcount="$fileCount" -vcatFS="$icatFS" '
+    BEGIN {
+        FS=catFS
+    }
+    {
+        while(i++<NF)
+        {
+            temp=tolower($i)
+            if(temp in arr)
+            {
+                if(arr[temp] == fcount-1)
+                {
+                    arr[temp]=0;
+                    if(gw=="")
+                    {
+                        gw=$i;
+                    }
+                    else
+                    {
+                        gw=(gw)(catFS)($i);
+                    }
+                }
+                else if(arr[temp] != 0)
+                {
+                    arr[temp]=arr[temp]+1;
+                }
+            }
+            else
+            {
+                arr[temp]=1;
+            }
+        }
+        print gw;
+          
+    }'  
+}
+
+if [[ "$callednumbers" && !"$calledheaders" ]]; then
+    callednumbers="${callednumbers// /}"
+    if [[ "$callednumbers" =~ "-" ]];then
+         callednumbers=$(eval echo `echo $callednumbers | sed 's/\([0-9]\+\)-\([0-9]\+\)/$(seq -s , \1 \2)/g'`)
+    fi
+    tempheaders=`echo "${headers//\\/\\\\}" | getAll`
+    calledheaders=`echo "$callednumbers" | awk -F"," -vcatFS="${icatFS}" '
+    BEGIN{
+        headcount=split("'"${tempheaders//\\/\\\\}"'", arr, (catFS));
+        
+    }
+    {   
+        while(!'$remover' && i++<NF)
+        {
+            if($i in arrs){}
+            else if($i != 0 && $i ~ "^[0-9]*$" && $i <= headcount)
+            {
+                arrs[$i]=$i;
+                if(gw=="")
+                {
+                    gw=arr[$i]
+                }
+                else
+                {
+                    gw=(gw)(catFS)(arr[$i])
+                }
+            }
+        }   
+
+        while('$remover' && x++<NF){
+            cnarr[$x]=1;
+        }
+        while('$remover' && i++ < headcount)
+        {
+            if(i != 0 && i ~ "^[0-9]*$" && i <= headcount && !(i in cnarr))
+            {
+                arrs[i]=i;
+                if(gw=="")
+                {
+                    gw=arr[i]
+                }
+                else
+                {
+                    gw=(gw)(catFS)(arr[i])
+                }
+            }
+        }
+        print gw
+    }'`
+
+    if [[ ! $calledheaders ]]; then
+        echo "Oops! An error has occured." >&2
+        exit;
+    fi
+    
+fi
+
+if [[ $fileCount -gt 1 || $calledheaders || $stat == "show" ]]; then
+
+    #Builds status appending filnames to headers not found in the files appended 
+    if [[ $stat == "show" ]]; then 
+        headers=`echo "${headers//\\/\\\\}" | getStatus`
+    else
+        #Full / Partial Merge / Calledheaders 
+        #Creates a unique list of headers previously found thoughout files
+        if [[ $merging != 0 || $fileCount == 1 ]]; then
+            if [[ $calledheaders && $tabmerge == "" ]]; then
+                if [[ $remover == 1 && ! "$callednumbers" ]]; then
+                    temp=`echo "$headers" | unCalledMatch`
+                else
+                    temp=`echo "$headers" | calledMatch`
+                fi
+                temp="${temp%`echo "$icatFS"`}"
+                headers="$temp"
+            fi
+          
+            headers=`echo "${headers//\\/\\\\}" | getAll`
+        
+        #Creates a list of only headers that are common amongst all files     
+        else
+            headers=`echo "${headers//\\/\\\\}" | getInCommon`
+        fi
+    fi
+fi
+if [[ ! $headers ]]; then
+    echo "No columns In common. Try Again" >&2;
+    exit -1;
+fi
+
+if [[ $tabmerge != "" ]];then
+    preBlanksCount=`echo "${headers//\\/\\\\}${icatFS}${firstheaders//\\/\\\\}" | getInCommon | awk -vcatFS="$icatFS" 'BEGIN{FS=(catFS)}{print NF}'`
+fi
+
+#Master function concatenating all files based on aquired header names
+merge()
+{
+barr="meeeeeeeeeooooooooow"
+if [[ "$USER" =~ bboparai|minh ]];then
+    barrK="                              .ZMMMMMN.     ..:+=.*        ,NMNZ~..             .MMZZZZZMM,.ZMMMMMMMM?.*      .+MM+=ZMMMMN......,++I7MMZZZZZZZMMMM~......+M~*      ~M8.......~MMMMMMMMMMMMMZZZZZZZZZM8.........MM*      MM...................~MZZZZZMMMMZMM8,.......MM.*     .MM...................NMZZZZZMZZMM8ZZMMMNMMMMMM.*     .MN...................M8ZZZZZMMMMZZZZZZMMZZZZZMM,*     .MM...................IMZZZZZZZMZZZZZZZMMZZZZZZMM*      MMMM..................NMM8Z8MMM8ZZZZZZMMMMZZZZMM..*      ,MM.....................+ZZ?,.?M8ZZZ8MMZMMZZZZMZ,,*     .MM..............................+MMMMZZ8ZZZZZMN.MMZ+~,*     +M7.................................~MZZZZZZMMMM.MMMMMM8I~,*    .MN...................................:MMMMMMN.,MIMMMMMMMMMN*    ?M~.............................................MMMMMMMMMMMM*    NM..............................................MM.?ZMMMMMMM*    MM...........................................~NMMMMMMMMN8MMM*..:+IMMZI:........................................?I=MM,......~78*NN+,:MM,........~MMN.....................MMM+........MM*    ,MI........ZMMM.....................MMMZ.......,MM*    .MM:,,......MN..........ZDZ:........+MZ........7MMMMMM*  +MMMMM,..................MIIIM+..................MM*  ..  IMZ..................8MDMM................ZIMM,*       ,MMMM=...................................,MMMMN*     .IMMMMM...................................~MM,..7MM,*   .NM?.  ,NMM7..............................ZMM+*   ...      .,MMMMNI.....................IMMMM,*           .:NMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM,*         .NMM+ZZZMMZZZMM~~,,,,++??,M8ZZZMMZZ~7MMN,*       .MMM.ZZ$,MMZZZZZM7~,,,,,,,,MMZZZZZMM.ZZ+.MMN*      ~MM+MM~.ZMMZZZZZZZMMD:,,,~MM8ZZZZZZZMM+.ZMM+MM*     ,M8...:MMMMZZMMMMZZZZZ8MMM8ZZZZZMMM8ZZMMMM:...8M~*    ,MZ......+MZZ8+..~MZZZZZZZZZZZZZM~..M8ZZM7......MM*    +M.......MMZZZM~,M8ZZZZZZZZZZZZZMM.~MZZZMM......?M*    ,M~.....ZMZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ8M......MM*    .NM~....MMZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZMI....+MM*      8MMMMMMMZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZMMMMMMM,*        ...:M8ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ8M+,,*           .M8ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ8M:M8*           ,M8ZZZZZZZZZZZZZZZMZZZZZZZZZZZZZZZZM,MN*           .MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM:M7*           ,MI..............7M...............+M:N,*           .MD..............7M...............ZM.+*            MM..............?M,.............,MZ.*            ,MM.............MM7.............MM.,*             .NMMMMD?7IIZNMMM7MMMNZII7ZZMMMM7.+*                ..IZMNMMZ7,.....+7NMMMMZ+..MM8,*                                      ..?MMMN+*                                      .:NMMM8*                                     ..IMMMM+*                                    ..ZMMMM~*                                    .,NMMMD.*                                    ..ZMMMM~*                                    .,NMMMD*"
+fi
+barrc="${#barr}"
+linecnt=`fgrep -c "" ${files[@]}`
+if [[ $tabmergeFile ]];then
+    tabmergeSize=`fgrep -c "" $tabmergeFile`
+    if [[ $tabmergeSize -lt 100 ]]; then
+        tabmergeSize=100
+    fi
+    if [[ ! -t 1 && ! -p /dev/stdout ]] && [[ $tabmergeSize -gt 100000 ]]; then
+        tabmergeBar=1
+    fi
+fi
+linecnt=`echo "$linecnt" | awk 'BEGIN{ORS=" "}{cn=split($0,arr,":");if(cn > 1){print arr[2];cnt+=arr[2];}else{ print arr[1];cnt+=arr[1]}}END{print cnt}'`
+linesize=`echo $linecnt | awk '{print $NF}'`
+if [[ ! -t 1 && ! -p /dev/stdout ]] && [[ $linesize -gt 100000 ]]; then
+    stdo=1;bar=1;
+fi
+awk -vobj="${mainer//\\/\\\\}" -vtab="${tab//\\/\\\\}" -vfirst="${firstheaders//\\/\\\\}" -vcatFS="$icatFS" -vcatFSR="$icatFSR" -vlinecnt="$linecnt" '
+function trimWhiteSpace(column){
+    return tolower(gensub(/^ +/, "", "", gensub(/ +$/, "", "", gensub(/\r/, "", "", column))));
+}
+BEGIN {
+    FS=(catFS);
+    if('$tabfilter'==0){arrcount=split(obj, arr, FS);}else{arrcount=split(first, arr, FS);}
+    tabmergeColIndexMain='$fhc'
+    tabmergeColIndex=0
+    mainindexTab="\"\""
+    tabmergeBlanks=""
+    mainindexTabClean="" 
+    if(!arrcount){arrcount=1}
+    for(i=1; i<=arrcount; i++)
+    {
+        printf("%s", arr[i]);
+        if (i<arrcount)
+        {
+            printf("%s", catFSR);
+        }
+        else
+        {
+            if("'$tabmerge'" != "" && "'$tabmergeFile'" != "")
+            {
+                tabcount=split(tab, tabarr, FS);
+                if(!tabcount){tabcount=1}
+                for(t=1; t<=tabcount; t++)
+                {
+                    if(tolower("'$tabmerge'") == tolower(tabarr[t]))
+                    {   
+                        tabmergeColIndex=t;
+                        break;   
+                    }
+                }
+                for(t=1; t<=arrcount-'$preBlanksCount'; t++)
+                {
+                    if(tabmergeBlanks!=""){
+                        tabmergeBlanks=(tabmergeBlanks)",""\"\"";
+                    }else{
+                        tabmergeBlanks=",""\"\"";
+                    }
+                }
+                if('$tabfilter'==0)
+                {    
+                    firstarrcnt=split(first, firstarr, FS);
+                    for(t=1; t<=tabcount; t++)
+                    { 
+                        flag=0
+                        tbak=t
+                        tr=tolower(tabarr[t])
+                        for(f=1; f<=firstarrcnt; f++)
+                        {   
+                            if(tolower(firstarr[f]) == tr)
+                            {    
+                                flag=1;
+                                badarr[tr]=1
+                                break;
+                            }
+                        }
+                        if(t==tabcount && '${#calledheaders}' != 0)
+                        {
+                            flag=1
+                            for(f=1; f<=arrcount; f++)
+                            {
+                                car=tolower(arr[f])
+                                for(t=1; t<=tabcount; t++)
+                                {    
+                                    tcar=tolower(tabarr[t])
+                                    if(car == tcar && !(tcar in badarr))
+                                    {   
+                                        flag=0;
+                                        badarr[tcar]=1
+                                        break;
+                                    }  
+                                }
+                                if(flag==0)
+                                {   
+                                    if(mainindexTab!="\"\""){
+                                    mainindexTab=(mainindexTab)"\""(catFSR)"\"""$"(t)
+                                    }else{mainindexTab="\""(catFSR)"\"""$"(t);}
+                                } 
+                            }
+                            
+                        }    
+                        if(flag==0 && '${#calledheaders}' == 0)
+                        {   
+                            if(mainindexTab!="\"\""){
+                            mainindexTab=(mainindexTab)"\""(catFSR)"\"""$"(t)
+                            }else{mainindexTab="\""(catFSR)"\"""$"(t);}
+                        }
+                        t=tbak
+                    }
+                }
+                if(flag && 0){tabmergeBlanks=""}
+            }     
+            printf("%s", "\n")
+        }
+    }
+    split(linecnt,linearr, " ")
+    
+}
+{
+    if(FNR == 1)
+    {
+        if("'$tabmerge'" == "" || '${#calledheaders}' != 0)
+        {
+            mainindex=""
+            r=1;
+            if ("'$tabmerge'" != ""){
+                arrcount='${firstheadersCount}';
+            }else if(NR == 1 && "'$merging'" != "0" && catFS == catFSR && '${#calledheaders}' == 0 && '$interactive' == 0){
+                mainindex="$"(0);
+                r=NF+1;
+            }
+            for(i=r; i<=arrcount; i++)
+            {
+                flag=0;
+                for(j=r; j<=NF; j++)
+                {
+                    temp=trimWhiteSpace($j);
+                    temp2=tolower(arr[i]);
+                    if(temp2==temp)
+                    {   
+                        if(mainindex!=""){
+                        mainindex=(mainindex)",""$"(j)
+                        }else{mainindex="$"(j)}
+                        flag=1;
+                        break;
+                    }  
+                }
+                if (flag == 0)
+                {
+                    if(mainindex!=""){
+                    mainindex=(mainindex)",""ins"
+                    }else{mainindex="ins"}
+                } 
+            }
+        }else{mainindex="$"(0)} 
+        startbar+=linearr[fn++]
+        if(startbar){startbar-=1}
+        endbar+=linearr[fn]
+        if(endbar<100){endbar=100}
+        fcount=NF
+        rFILENAME=FILENAME
+        sub(".*/","",rFILENAME)
+        system("sed 1d \""(FILENAME)"\" | sed \"s/\r//g\" | awk -vcatFS=\"'"${icatFS//\\/\\\\\\\\}"'\" -vcatFSR=\"'"${icatFSR//\\/\\\\\\\\}"'\" -vinsert=\"'"${insert//\\/\\\\\\\\}"'\"  \047BEGIN{FS=catFS; OFS=catFSR; ins=(insert); if('"$bar"' || !'"$stdo"'){i="(startbar)"; stbar=i; enbar="(endbar)"; bar=\"'"$barr"'\"; barlength=length(bar); while(i<enbar){i+=int(enbar/100);perc[i]=int((i)*100/'"$linesize"');}};if(\"'$tabmerge'\" != \"\" && \"'$tabmergeFile'\" != \"\"){ while(getline < \"'$tabmergeFile'\") { p++; if(!(p%int('"$(($tabmergeSize/100))"')) && '$tabmergeBar'){pp++; printf(\"\r Building tabmerge dictionary %s%%\", pp) > \"/dev/stderr\"} tabmergeString[tolower(gensub(/^ +/, \"\", \"\", gensub(/ +$/, \"\", \"\", gensub(/\r/, \"\", \"\", $"(tabmergeColIndex)"))))]="gensub(/\r/, "", "",mainindexTab)"; } }}{if(('"$bar"' || !'"$stdo"') && !'${#barrK}' && FNR+stbar in perc){n=perc[FNR+stbar]/100*(barlength); printf(\"\r Gcat working...: [%-'"$barrc"'s] %s%%\", substr(bar,0,n), perc[FNR+stbar]) > \"/dev/stderr\"}\
+else if(('"$bar"' || !'"$stdo"') && '${#barrK}' && !((stbar+FNR)%int('$linesize'/2832))){\
+    n=int(int(((stbar+FNR)*2832)/'"$linesize"')/2832*('${#barrK}'));\
+    if(!f){f=1}\
+    if(!f){f=1;}\
+    if(n && n <= '${#barrK}'){\
+        printf(\"%s\", gensub(/*/, \"\\n\", \"g\", substr(\"'"${barrK}"'\",n-f,f))) > \"/dev/stderr\";\
+    }\
+}\
+if('"$err"' && NF != "(fcount)"){if(!error){print \"\rERROR: Too few/many fields found in - "(rFILENAME)" -          \\n All errors written to \\\"gcat-"(rFILENAME)"-error\\\" and removed from output\\n Use -e to turn off error checking\" > \"/dev/stderr\"}; print $0 > \"gcat-"(rFILENAME)"-error\";error++;}else{if(\"'$tabmerge'\" != \"\"){tempkey=tolower(gensub(/^ +/, \"\", \"\", gensub(/ +$/, \"\", \"\", $"(tabmergeColIndexMain)")));if(tempkey in tabmergeString){ if(!'$tabfilter'){print "(mainindex)"tabmergeString[tempkey]; hits++}}else{if(!'$tabdedupe' || ('$fileCount' == 1 && !tb[tempkey]++)){print "(mainindex)""(tabmergeBlanks)"; misses++}}}else{print "(mainindex)";}}}END{if(error){printf(\"\r ERROR(S): %s%-50s\\n\", error,\" \") > \"/dev/stderr\"};if(('"$bar"' || !'"$stdo"') && \"'$tabmerge'\" != \"\"){printf(\"\r Gcat working...: ['"$barr"'] 100%%\\n Gcat Done!\\n\") > \"/dev/stderr\";} if(\"'$tabmerge'\" != \"\"){ht=\"Hits\"; mt=\"Misses\";if('$fileCount' == 1){ht=\"Output\"; mt=\"Removed\"; hits=misses; misses="linearr[1]"-misses-1}else if('$tabdedupe'){ht=\"Output\"; mt=\"Removed\"; misses="linearr[1]"-hits-error-1}else if('$tabfilter'){ht=\"Output\"; mt=\"Removed\"; hits=misses; misses="linearr[1]"-misses-error-1}printf(\"\\r %s: %s                             \\n %s: %s\\n\", ht, (hits+0), mt, (misses+0)) > \"/dev/stderr\";}}\047")
+        nextfile;
+    }
+}END {
+        if(('"$bar"' || !'"$stdo"') && "'$tabmerge'" == "" && !'${#barrK}'){printf("\r Gcat working...: ['"$barr"'] 100%%\n Gcat Done!\n") > "/dev/stderr"}
+        if(('"$bar"' || !'"$stdo"') && "'$tabmerge'" == "" && '${#barrK}'){printf("\n Gcat Done!\n") > "/dev/stderr"}
+    }' ${files[@]}
+}
+
+#Fast Visual Mode - Prints list of all headers in same order as they would be gcat'ed to screen
+visualFast()
+{   
+    echo "${headers%`echo "$icatFS"`}" | tr "$IFS" "\n" | awk '
+    {   
+        temphead = $0
+        if ( '$stdo' == 0 ){
+            gsub(/^'\''/,"", temphead)
+            gsub(/'\''$/,"", temphead)
+            if(NR-1 < "'$headscount'" && NR-1 == "'$firstcount'"){
+                print " ---- Adding new columns shown below which are not found in ""'${files[0]}'"" ----"
+            }
+        }else{
+            tempfiles = $0
+            tempmiss = $0
+            if (!gsub(/.*:::".*/," -Missing from- ", tempmiss)){ tempmiss="" }
+            if (tempfiles ~ "\":::"){
+                gsub(/":::"/,"`, `", tempfiles)
+                gsub(/[^:]*:::"/,"`", tempfiles)
+                gsub(/":::.*/,"`", tempfiles)
+            }else{ tempfiles="" }
+            if (!gsub(/:::.*/,"", temphead)){ temphead=$0 }
+        }
+        print" "NR") ""'${ESC}${BCYAN}'"temphead"'${ESC}${NORMAL}'"(tempmiss)(tempfiles)
+    }'
+}
+
+#Visual Mode - Used in interactive (-i) mode and status (-s) mode
+visualView()
+{
+    if [[ $1 == iview ]]; then 
+        echo -n " Pick your columns. (ex: 1,2,3 or 1-3 or ^1,2) "
+        read like
+        like="${like// /}"
+        if [[ $like == "x" ]]; then
+            exit;
+        fi
+        if [[ $like = "v" ]]; then
+            visualFast | less -R
+            visualView iview
+        fi
+    else
+        if [[ $headscount -gt 300 && $visualStat != "vshow" ]]; then
+            echo -e "Wow, you have $headscount columns."
+            if [[ $stdo == 0 ]]; then
+                echo "Please view in less: type v"
+            fi
+        else
+            visualFast        
+        fi
+        if [[ $stat == "show" ]]; then
+            test=`echo "${headers}" | tr "$IFS" "\n" | grep :::\"`
+            if [[ ! $test && $fileCount -gt 1 ]]; then 
+                if [[ `head -1q ${files[@]} | awk '{!a[tolower($0)]++}END{print length(a)}'` == 1 ]]; then
+                    echo -e "\nHurray! All Files have the exact same column headers."
+                else
+                    echo -e "\nFiles have equal column header names, **BUT** they are out of order!"
+                fi
+            fi
+        fi
+    fi
+}
+
+
+if [[ ! $calledheaders && $stdo == 0 ]] || [[ $stat == "show"  ]]; then
+    realheaders="$headers"
+    firstheadersT="$firstheaders"
+    #Used for using set
+    if [[ $stat != "show" ]]; then
+        if [[ "$icatFS" =~ "/" ]] ;then theifs="${icatFS////\\/}"; else theifs="${icatFS//\\/\\\\\\\\}"; fi
+        headers=$(echo "$headers" | sed -e "s/${theifs}/\'${theifs}\'/g" -e "s/^/\'/" -e "s/$/\'/")
+        firstheaders=$(echo "$firstheaders" | sed -e "s/${theifs}/\'${theifs}\'/g" -e "s/^/\'/" -e "s/$/\'/")
+    fi
+    set -- $firstheaders; firstcount="$#"
+    set -- $headers; headscount="$#"
+    if [[ $visualStat == "vshow" ]]; then 
+        visualView | less -R;
+    else
+        if [[ ! -t 1 ]]; then
+            BCYAN="";NORMAL="";ESC="";
+        fi
+        visualView;
+        if [[ $headscount -gt 30 && $stat == "show" ]]; then echo -e "\nToo many columns? View in less: gcat -v [FILE]..."; fi
+    fi
+    if [[ $stat == "show" ]]; then exit; fi
+    echo -e "\n Type 0 to choose all columns.\n Type v to view in less.\n To remove columns precede all with ^"
+    visualView iview
+     
+    if [[ "$like" == "0" ]]
+    then
+        mainer="${realheaders}"
+    else
+        if [[ "${like:0:1}" == "^" ]]; then
+             all=`echo "$(seq 1 $headscount)" | tr "\n" "$icatFS"`
+             like=`echo ${like#*^}`
+        fi
+        if [[ "$like" =~ "-" ]];then
+             like=$(eval echo `echo $like | sed 's/\([0-9]\+\)-\([0-9]\+\)/$(seq -s , \1 \2)/g'`)
+        fi
+        like=`echo "$like" | awk -F"," -vcatFS="${icatFS}" -vheadcount="$headscount" '{
+        while(i++<NF)
+        {
+            if($i in arrs){}
+            else if($i != 0 && $i ~ "^[0-9]*$" && $i <= headcount)
+            {    
+                arrs[$i]=$i; 
+                if(gw=="")
+                {
+                    gw=arrs[$i]
+                }
+                else
+                {
+                    gw=(gw)(catFS)(arrs[$i])
+                }
+            }
+        } 
+        print gw
+        }'`
+        if [[ ! $like ]]; then
+            echo "Oops! An error has occured." >&2
+            exit;
+        fi
+        if [[ "${#all}" != 0 ]]; then
+            for x in ${all[@]}; do
+                bad="0"
+                for y in ${like[@]}; do
+                    if [[ "$x" == "$y" ]]; then
+                        bad="1"
+                    fi
+                done
+                if [[ "$bad" == "0" ]]; then 
+                    if [[ "$good" ]]; then 
+                        good="$good$icatFS$x";
+                    else
+                        good="$x"
+                    fi
+                fi
+            done
+            like="$good"
+        fi
+        if [[ ! $like ]]; then
+            echo "No columns left" >&2
+            exit;
+        fi
+        gotit=0
+        for i in ${like[@]}; do
+            i="${!i}"
+            i=$(echo "${i%\'}" | sed "s/'//")
+            if [[ $gotit == 1 ]]; then
+                mainer="${mainer}${IFS}${i}";
+            else
+                gotit=1
+                mainer="${i}"
+            fi
+        done 
+        if [[ $tabmerge != "" ]];then
+            calledheaders="${mainer}"
+            temp=`echo "$firstheadersT" | calledMatch`
+            temp="${temp%`echo "$icatFS"`}"
+            firstheadersCount=`echo "$temp" | awk -vcatFS="$icatFS" 'BEGIN{FS=(catFS)}{print NF}'`
+        fi  
+    fi
+else
+    mainer="${headers}"
+fi
+
+fileout()
+{
+    echo -n " Please enter the output file name: "
+    read output
+    if [[ -e "$output" ]]; then
+        for i in ${files[@]}; do
+            if [[ "$i" == "$output" ]]; then
+                outnope="1"
+                break
+            fi
+        done
+        if [[ "$outnope" == "1" ]]; then
+            echo "   Sorry, you can't overwrite file $output. Try Again."
+            outnope="0"
+            fileout
+        else
+            echo -n "   Overwrite file $output? (y)es or (n)o: "
+            read yesout
+            if [[ "$yesout" != "y" && "$yesout" != "yes" ]]; then
+                fileout
+            fi 
+        fi
+    fi
+}
+
+if [[ $stdo == 0 ]]; then  
+    fileout    
+    merge > "$output"
+else
+    merge
+fi
+
+IFS="$OFS"
